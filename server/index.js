@@ -15,6 +15,14 @@ import * as api from "./api.js";
 import { encode } from '@toon-format/toon';
 import { sanitize_api_response } from './sanitizer.js';
 
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || null;
+let apiSchemaCache = null;
+const ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/complete';
+
+async function refresh_api_schema() {
+    apiSchemaCache = await api.api_get_api_schema();
+}
+
 // Get version from package.json
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -126,6 +134,279 @@ async function process_resource_response(uri, data) {
     return format_resource_response(uri, sanitizeResult);
 }
 
+function truncate(text, max) {
+    if (text === undefined || text === null) {
+        return "";
+    }
+    const value = String(text);
+    return value.length <= max ? value : `${value.slice(0, max - 1)}…`;
+}
+
+function getArrayField(data, fieldNames) {
+    if (Array.isArray(data)) {
+        return data;
+    }
+    if (data && typeof data === 'object') {
+        for (const field of fieldNames) {
+            if (Array.isArray(data[field])) {
+                return data[field];
+            }
+        }
+    }
+    return [];
+}
+
+function normalizeTicket(item) {
+    const title = item.name || item.title || item.summary || item.issue_title || item.subject || "";
+    const description = item.description || item.long_description || item.details || item.summary || item.notes || "";
+    const key = item.key || item.jira_key || item.issue_key || item.ticket_key || item.id || "";
+    return {
+        key: String(key),
+        title: truncate(title, 200),
+        description: truncate(description, 1000)
+    };
+}
+
+function normalizePullRequest(item) {
+    return {
+        id: item.id || item.pull_request_number || item.pr_id || "",
+        title: truncate(item.title || item.name || item.summary || item.subject || "", 200),
+        description: truncate(item.description || item.body || item.details || "", 500)
+    };
+}
+
+function extractCategories(data) {
+    return getArrayField(data, ["work_categories", "results", "data"]);
+}
+
+function extractTickets(data) {
+    return getArrayField(data, ["work_category_contents", "results", "data", "items", "contents"]);
+}
+
+function extractPullRequests(data) {
+    return getArrayField(data, ["unlinked_pull_requests", "results", "data"]);
+}
+
+function parseDateRange(dateRange) {
+    if (!dateRange) {
+        return {};
+    }
+    if (typeof dateRange === 'string') {
+        const parts = dateRange.split(/\s+to\s+|,|\|/i).map(part => part.trim()).filter(Boolean);
+        if (parts.length === 2) {
+            return { start_date: parts[0], end_date: parts[1] };
+        }
+        return {};
+    }
+    if (typeof dateRange === 'object' && dateRange.start_date && dateRange.end_date) {
+        return { start_date: dateRange.start_date, end_date: dateRange.end_date };
+    }
+    return {};
+}
+
+function buildPrompt(pr, candidates, maxSuggestions) {
+    const candidateList = candidates.slice(0, 20).map((ticket, index) => {
+        return `${index + 1}. ${ticket.key || '[unknown key]'} | ${ticket.title}
+Description: ${ticket.description}`;
+    }).join('\n\n');
+
+    return `Human: Match the pull request below to the best Jira ticket candidates.
+
+PR Title: ${pr.title}
+PR Description: ${pr.description}
+
+Candidate tickets:
+${candidateList}
+
+Return a JSON array of objects with keys: key, title, confidence. Use a confidence score from 0.0 to 1.0. Return at most ${maxSuggestions} suggestions. Do not include any text outside the JSON array.
+
+Assistant:`;
+}
+
+function parseAnthropicResponse(text) {
+    try {
+        return JSON.parse(text);
+    } catch (error) {
+        const jsonMatch = text.match(/(\[\s*\{[\s\S]*\}\s*\])/);
+        if (jsonMatch) {
+            return JSON.parse(jsonMatch[1]);
+        }
+        throw new Error('Unable to parse Anthropic response as JSON');
+    }
+}
+
+async function callAnthropic(prompt) {
+    if (!ANTHROPIC_API_KEY) {
+        return { error: 'No Anthropic API key found. Set process.env.ANTHROPIC_API_KEY.' };
+    }
+
+    const response = await fetch(ANTHROPIC_API_URL, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'X-API-Key': ANTHROPIC_API_KEY
+        },
+        body: JSON.stringify({
+            model: 'claude-sonnet-4-6',
+            prompt,
+            max_tokens_to_sample: 256,
+            temperature: 0.0,
+            stop_sequences: ['\n\nHuman:']
+        })
+    });
+
+    if (!response.ok) {
+        const body = await response.text();
+        return { error: `Anthropic API request failed with status ${response.status}`, message: body };
+    }
+
+    const result = await response.json();
+    if (!result.completion) {
+        return { error: 'Anthropic response missing completion text' };
+    }
+    return result.completion;
+}
+
+async function collectCandidateTickets(params) {
+    const categoriesData = await api.api_work_categories({ format: 'json' });
+    const categories = extractCategories(categoriesData);
+    const tickets = [];
+
+    for (const category of categories) {
+        const slug = category.slug || category.work_category_slug || category.name;
+        if (!slug) {
+            continue;
+        }
+        const categoryParams = {
+            work_category_slug: slug,
+            format: 'json',
+            ...params
+        };
+        const contentsData = await api.api_work_category_contents(categoryParams);
+        tickets.push(...extractTickets(contentsData));
+    }
+
+    return tickets.map(normalizeTicket).filter(ticket => ticket.title || ticket.key);
+}
+
+export async function suggest_pr_jira_links(params = {}) {
+    const minConfidence = Number(params.min_confidence ?? 0.5);
+    const maxSuggestions = Number(params.max_suggestions_per_pr ?? 3);
+    const { start_date, end_date } = parseDateRange(params.date_range);
+    const teamId = params.team_id;
+
+    if (Number.isNaN(minConfidence) || minConfidence < 0.0 || minConfidence > 1.0) {
+        return { error: 'min_confidence must be a number between 0.0 and 1.0' };
+    }
+    if (!Number.isInteger(maxSuggestions) || maxSuggestions < 1) {
+        return { error: 'max_suggestions_per_pr must be a positive integer' };
+    }
+
+    const prParams = {};
+    if (start_date) prParams.start_date = start_date;
+    if (end_date) prParams.end_date = end_date;
+    if (teamId !== undefined) prParams.team_id = teamId;
+
+    const prData = await api.api_unlinked_pull_requests(prParams);
+    const prItems = extractPullRequests(prData);
+    if (prItems.length === 0) {
+        return { suggestions: [] };
+    }
+
+    const candidateParams = {};
+    if (start_date) candidateParams.start_date = start_date;
+    if (end_date) candidateParams.end_date = end_date;
+    if (teamId !== undefined) candidateParams.team_id = teamId;
+
+    const rawCandidates = await collectCandidateTickets(candidateParams);
+    if (rawCandidates.length === 0) {
+        if (!apiSchemaCache) {
+            apiSchemaCache = await api.api_get_api_schema();
+        }
+        return { error: 'Unable to retrieve candidate tickets from work_category_contents using existing schema.' };
+    }
+
+    const suggestions = [];
+    for (const prItem of prItems) {
+        const pr = normalizePullRequest(prItem);
+        const prompt = buildPrompt(pr, rawCandidates, maxSuggestions);
+        const llmResult = await callAnthropic(prompt);
+        if (llmResult.error) {
+            return llmResult;
+        }
+
+        let matches;
+        try {
+            matches = parseAnthropicResponse(llmResult);
+        } catch (error) {
+            return { error: error.message };
+        }
+
+        const normalized = Array.isArray(matches) ? matches
+            .filter(match => typeof match === 'object' && match !== null)
+            .map(match => ({
+                key: String(match.key || match.id || match.issue_key || ''),
+                title: truncate(match.title || match.name || '', 200),
+                confidence: Math.max(0, Math.min(1, Number(match.confidence || 0)))
+            }))
+            .filter(match => match.key && match.confidence >= minConfidence)
+            .slice(0, maxSuggestions)
+            : [];
+
+        suggestions.push({
+            pull_request: pr,
+            suggestions: normalized
+        });
+    }
+
+    return {
+        suggestions,
+        candidate_ticket_count: rawCandidates.length,
+        pull_request_count: prItems.length
+    };
+}
+
+export async function suggest_pr_jira_links_from_data(prs, candidates, options = {}) {
+    const minConfidence = Number(options.min_confidence ?? 0.5);
+    const maxSuggestions = Number(options.max_suggestions_per_pr ?? 3);
+    const normalizedCandidates = candidates.map(normalizeTicket).filter(ticket => ticket.title || ticket.key);
+    const suggestions = [];
+
+    for (const prItem of prs) {
+        const pr = normalizePullRequest(prItem);
+        const prompt = buildPrompt(pr, normalizedCandidates, maxSuggestions);
+        const llmResult = await callAnthropic(prompt);
+        if (llmResult.error) {
+            return llmResult;
+        }
+
+        let matches;
+        try {
+            matches = parseAnthropicResponse(llmResult);
+        } catch (error) {
+            return { error: error.message };
+        }
+
+        const normalized = Array.isArray(matches) ? matches
+            .filter(match => typeof match === 'object' && match !== null)
+            .map(match => ({
+                key: String(match.key || match.id || match.issue_key || ''),
+                title: truncate(match.title || match.name || '', 200),
+                confidence: Math.max(0, Math.min(1, Number(match.confidence || 0)))
+            }))
+            .filter(match => match.key && match.confidence >= minConfidence)
+            .slice(0, maxSuggestions)
+            : [];
+
+        suggestions.push({ pull_request: pr, suggestions: normalized });
+    }
+
+    return {
+        suggestions,
+        candidate_ticket_count: normalizedCandidates.length,
+        pull_request_count: prs.length
+    };
+}
 
 // Handler to list all available resources (returns API schema resource)
 server.setRequestHandler(ListResourcesRequestSchema, async () => {
@@ -419,6 +700,35 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                     required: ["work_category_slug"]
                 }
             },
+            {
+                name: "suggest_pr_jira_links",
+                description: "Suggest Jira ticket matches for unlinked PRs using semantic matching.",
+                inputSchema: {
+                    type: "object",
+                    properties: {
+                        team_id: {
+                            oneOf: [
+                                { type: "integer" },
+                                { type: "string" },
+                                { type: "array", items: { type: "integer" } }
+                            ],
+                            description: "Team ID or list of team IDs used to filter candidate tickets."
+                        },
+                        date_range: {
+                            type: "object",
+                            properties: {
+                                start_date: { type: "string", description: "Start date (YYYY-MM-DD)" },
+                                end_date: { type: "string", description: "End date (YYYY-MM-DD)" }
+                            },
+                            required: ["start_date", "end_date"],
+                            description: "Date range used to filter PRs and candidate tickets."
+                        },
+                        min_confidence: { type: "number", default: 0.5, description: "Minimum confidence threshold for suggestions (0.0 to 1.0)." },
+                        max_suggestions_per_pr: { type: "integer", default: 3, description: "Maximum number of suggestions to return per PR." }
+                    },
+                    required: []
+                }
+            },
             // DEVEX
             {
                 name: "devex_insights_by_team",
@@ -631,6 +941,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             return process_tool_response(await api.api_team_sprint_summary(params));
         case "unlinked_pull_requests":
             return process_tool_response(await api.api_unlinked_pull_requests(params));
+        case "suggest_pr_jira_links":
+            return process_tool_response(await suggest_pr_jira_links(params));
 
         // PEOPLE
         case "list_engineers":
@@ -651,9 +963,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
 // Main function to start the MCP server with stdio transport
 async function main() {
+    await refresh_api_schema();
     const transport = new StdioServerTransport();
     await server.connect(transport);
 }
 
-// Start the server and handle any errors
-main().catch(console.error);
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+    main().catch(console.error);
+}
