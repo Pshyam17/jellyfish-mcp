@@ -43,6 +43,7 @@ The server provides several tools for interacting with the Jellyfish API. Each t
 - `deliverable_scope_and_effort_history`
 - `work_categories`
 - `work_category_contents`
+- `suggest_pr_jira_links`
 
 #### DevEx
 
@@ -96,6 +97,7 @@ It's important to know about the environment variables since you will need to co
 | Variable | Description | Required | Default |
 |----------|-------------|----------|---------|
 | `JELLYFISH_API_TOKEN` | Your Jellyfish API token. | Yes | - |
+| `ANTHROPIC_API_KEY` | Required for PR to Jira semantic matching. Get one at console.anthropic.com. | No | - |
 | `HUGGINGFACE_API_TOKEN` | Your Hugging Face API token. If not provided, PromptGuard is disabled and data is always returned. | No | - |
 | `MODEL_AVAILABILITY` | Controls behavior when PromptGuard cannot be reached (service unavailable, timeout, or invalid token). Set to `true` to allow data if PromptGuard cannot be reached. Set to `false` to block data until PromptGuard can verify response. | No | `false` |
 | `MODEL_TIMEOUT` | How long to wait for the PromptGuard model to respond, in seconds. | No | `10` |
